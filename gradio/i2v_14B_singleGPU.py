@@ -1,12 +1,14 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
 import gc
-import os.path as osp
 import os
+import os.path as osp
 import sys
 import warnings
 
 import gradio as gr
+import torch
+import torch.distributed as dist
 
 warnings.filterwarnings('ignore')
 
@@ -21,11 +23,24 @@ from wan.utils.utils import cache_video
 prompt_expander = None
 wan_i2v_480P = None
 wan_i2v_720P = None
+local_rank = 0  # will be updated in distributed initialization
+
+
+def init_distributed():
+    global local_rank
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl')
+        print(f"Distributed process initialized. LOCAL_RANK={local_rank}")
+    else:
+        local_rank = 0
+        print("Running in single GPU/CPU mode.")
 
 
 # Button Func
 def load_model(value):
-    global wan_i2v_480P, wan_i2v_720P
+    global wan_i2v_480P, wan_i2v_720P, local_rank
 
     if value == '------':
         print("No model loaded")
@@ -38,17 +53,19 @@ def load_model(value):
         if wan_i2v_720P is not None:
             pass
         else:
-            del wan_i2v_480P
-            gc.collect()
-            wan_i2v_480P = None
+            # If loading a 720P model, delete the 480P model if it exists
+            if wan_i2v_480P is not None:
+                del wan_i2v_480P
+                gc.collect()
+                wan_i2v_480P = None
 
             print("load 14B-720P i2v model...", end='', flush=True)
             cfg = WAN_CONFIGS['i2v-14B']
             wan_i2v_720P = wan.WanI2V(
                 config=cfg,
                 checkpoint_dir=args.ckpt_dir_720p,
-                device_id=0,
-                rank=0,
+                device_id=local_rank,
+                rank=local_rank,
                 t5_fsdp=False,
                 dit_fsdp=False,
                 use_usp=False,
@@ -63,17 +80,19 @@ def load_model(value):
         if wan_i2v_480P is not None:
             pass
         else:
-            del wan_i2v_720P
-            gc.collect()
-            wan_i2v_720P = None
+            # If loading a 480P model, delete the 720P model if it exists
+            if wan_i2v_720P is not None:
+                del wan_i2v_720P
+                gc.collect()
+                wan_i2v_720P = None
 
             print("load 14B-480P i2v model...", end='', flush=True)
             cfg = WAN_CONFIGS['i2v-14B']
             wan_i2v_480P = wan.WanI2V(
                 config=cfg,
                 checkpoint_dir=args.ckpt_dir_480p,
-                device_id=0,
-                rank=0,
+                device_id=local_rank,
+                rank=local_rank,
                 t5_fsdp=False,
                 dit_fsdp=False,
                 use_usp=False,
@@ -89,8 +108,7 @@ def prompt_enc(prompt, img, tar_lang):
         print('Please upload an image')
         return prompt
     global prompt_expander
-    prompt_output = prompt_expander(
-        prompt, image=img, tar_lang=tar_lang.lower())
+    prompt_output = prompt_expander(prompt, image=img, tar_lang=tar_lang.lower())
     if prompt_output.status == False:
         return prompt
     else:
@@ -99,14 +117,9 @@ def prompt_enc(prompt, img, tar_lang):
 
 def i2v_generation(img2vid_prompt, img2vid_image, resolution, sd_steps,
                    guide_scale, shift_scale, seed, n_prompt):
-    # print(f"{img2vid_prompt},{resolution},{sd_steps},{guide_scale},{shift_scale},{seed},{n_prompt}")
-
     if resolution == '------':
-        print(
-            'Please specify at least one resolution ckpt dir or specify the resolution'
-        )
+        print('Please specify at least one resolution ckpt dir or specify the resolution')
         return None
-
     else:
         if resolution == '720P':
             global wan_i2v_720P
@@ -244,12 +257,12 @@ def _parse_args():
         "--ckpt_dir_720p",
         type=str,
         default=None,
-        help="The path to the checkpoint directory.")
+        help="The path to the checkpoint directory for the 720P model.")
     parser.add_argument(
         "--ckpt_dir_480p",
         type=str,
         default=None,
-        help="The path to the checkpoint directory.")
+        help="The path to the checkpoint directory for the 480P model.")
     parser.add_argument(
         "--prompt_extend_method",
         type=str,
@@ -261,23 +274,32 @@ def _parse_args():
         type=str,
         default=None,
         help="The prompt extend model to use.")
+    # Optionally add a local_rank argument (if not provided via environment)
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=0,
+        help="Local rank for distributed training")
 
     args = parser.parse_args()
-    assert args.ckpt_dir_720p is not None or args.ckpt_dir_480p is not None, "Please specify at least one checkpoint directory."
+    assert args.ckpt_dir_720p is not None or args.ckpt_dir_480p is not None, \
+        "Please specify at least one checkpoint directory."
 
     return args
 
 
 if __name__ == '__main__':
     args = _parse_args()
+    init_distributed()  # initialize multi-GPU distributed process if applicable
 
     print("Step1: Init prompt_expander...", end='', flush=True)
     if args.prompt_extend_method == "dashscope":
         prompt_expander = DashScopePromptExpander(
             model_name=args.prompt_extend_model, is_vl=True)
     elif args.prompt_extend_method == "local_qwen":
+        # Use the local_rank device for prompt expansion if applicable
         prompt_expander = QwenPromptExpander(
-            model_name=args.prompt_extend_model, is_vl=True, device=0)
+            model_name=args.prompt_extend_model, is_vl=True, device=local_rank)
     else:
         raise NotImplementedError(
             f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
